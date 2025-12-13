@@ -24,34 +24,34 @@ Or install globally:
     specify init --here
 """
 
+import json
 import os
-import subprocess
-import sys
-import zipfile
-import tempfile
+import re
 import shutil
 import shlex
-import json
+import ssl
+import subprocess
+import sys
+import tempfile
+import uuid
+import zipfile
 from pathlib import Path
 from typing import Optional, Tuple
 
-import typer
 import httpx
+import readchar
+import truststore
+import typer
+from datetime import datetime, timezone
+from rich.align import Align
 from rich.console import Console
+from rich.live import Live
 from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn
-from rich.text import Text
-from rich.live import Live
-from rich.align import Align
 from rich.table import Table
+from rich.text import Text
 from rich.tree import Tree
 from typer.core import TyperGroup
-
-# For cross-platform keyboard input
-import readchar
-import ssl
-import truststore
-
 ssl_context = truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
 client = httpx.Client(verify=ssl_context)
 
@@ -63,6 +63,184 @@ def _github_auth_headers(cli_token: str | None = None) -> dict:
     """Return Authorization header dict only when a non-empty token exists."""
     token = _github_token(cli_token)
     return {"Authorization": f"Bearer {token}"} if token else {}
+
+INVALID_CHARS = ['<', '>', '"', '|', '?', '*', '\0']
+
+def validate_spec_dir(spec_dir: str) -> str:
+    """Validate and return a sanitized spec directory path.
+
+    Args:
+        spec_dir: User-provided spec directory path
+
+    Returns:
+        Sanitized spec directory path
+
+    Raises:
+        SystemExit: If validation fails
+    """
+    # Check for leading/trailing whitespace in original (before stripping)
+    if spec_dir.strip() != spec_dir:
+        console.print("[red]Error:[/red] Spec directory cannot start or end with whitespace")
+        raise SystemExit(1)
+
+    # Strip whitespace for validation
+    spec_dir = spec_dir.strip()
+
+    # Check if result is empty after stripping
+    if not spec_dir:
+        console.print("[red]Error:[/red] Spec directory cannot be empty")
+        raise SystemExit(1)
+
+    # Enhanced path validation: check for absolute paths and parent traversal
+    drive, _ = os.path.splitdrive(spec_dir)
+    is_absolute = os.path.isabs(spec_dir) or bool(drive)
+
+    # More robust parent traversal detection - only catch actual directory traversal
+    has_parent_traversal = (
+        spec_dir.startswith("../") or
+        "/.." in spec_dir or
+        "\\.." in spec_dir or
+        spec_dir.endswith("/..") or
+        spec_dir.endswith("\\..") or
+        "/../" in spec_dir or
+        "\\..\\" in spec_dir
+    )
+
+    if is_absolute or has_parent_traversal:
+        if is_absolute:
+            if drive:
+                console.print(f"[red]Error:[/red] Spec directory must be relative to project root, not an absolute path or Windows drive (found: '{drive}')")
+            else:
+                console.print("[red]Error:[/red] Spec directory must be relative to project root, not an absolute path")
+        else:
+            console.print("[red]Error:[/red] Spec directory cannot contain parent directory traversal (..)")
+        raise SystemExit(1)
+
+    # Enhanced character validation: handle Unicode and invalid characters efficiently
+    invalid_chars = set(INVALID_CHARS)
+    # Colon is always invalid since absolute paths are already caught above
+    if ':' in spec_dir:
+        invalid_chars.add(':')
+
+    # Check for control characters (including null)
+    for char in spec_dir:
+        if ord(char) < 32 and char not in ('\t', '\n', '\r'):
+            console.print(f"[red]Error:[/red] Spec directory contains invalid control character at position {spec_dir.index(char)}")
+            console.print("[dim]Tip: Control characters cannot be used in directory names[/dim]")
+            raise SystemExit(1)
+
+    found_invalid_chars = {char for char in spec_dir if char in invalid_chars}
+    if found_invalid_chars:
+        # Provide helpful error message with character descriptions (only when needed)
+        char_descriptions = {
+            '<': 'less-than (<)',
+            '>': 'greater-than (>)',
+            '"': 'double quote (")',
+            '|': 'pipe (|)',
+            '?': 'question mark (?)',
+            '*': 'asterisk (*)',
+            '\0': 'null character',
+            ':': 'colon (:)'
+        }
+
+        described_chars = [char_descriptions.get(char, f"'{char}'") for char in sorted(found_invalid_chars)]
+        console.print(f"[red]Error:[/red] Spec directory contains invalid characters: {', '.join(described_chars)}")
+        console.print("[dim]Tip: These characters are not allowed in directory names on most filesystems[/dim]")
+        raise SystemExit(1)
+
+    # Check for trailing slashes/backslashes
+    if spec_dir.endswith(('/', '\\')):
+        console.print("[red]Error:[/red] Spec directory cannot end with a slash or backslash")
+        raise SystemExit(1)
+
+    # Check length (filesystem limit with helpful message)
+    if len(spec_dir) > 255:
+        console.print(f"[red]Error:[/red] Spec directory path is too long ({len(spec_dir)} characters, max 255)")
+        console.print("[dim]Tip: Consider using a shorter directory name[/dim]")
+        raise SystemExit(1)
+
+    # Enhanced alphanumeric check with better error message
+    if not spec_dir[0].isalnum():
+        # Provide specific guidance based on what was found
+        if spec_dir[0] in '-_.':
+            console.print(f"[red]Error:[/red] Spec directory cannot start with '{spec_dir[0]}' - it must start with a letter or number")
+        else:
+            console.print(f"[red]Error:[/red] Spec directory must start with an alphanumeric character (found: '{spec_dir[0]}')")
+        console.print("[dim]Tip: Start directory names with a letter (a-z, A-Z) or number (0-9)[/dim]")
+        raise SystemExit(1)
+
+    # Check for reserved names (Windows compatibility) - lightweight check
+    reserved_names = {
+        'CON', 'PRN', 'AUX', 'NUL',
+        'COM1', 'COM2', 'COM3', 'COM4', 'COM5', 'COM6', 'COM7', 'COM8', 'COM9',
+        'LPT1', 'LPT2', 'LPT3', 'LPT4', 'LPT5', 'LPT6', 'LPT7', 'LPT8', 'LPT9'
+    }
+
+    # Check if the directory name (first component) is a reserved name
+    first_component = spec_dir.replace('\\', '/').split('/')[0].upper()
+    if first_component in reserved_names:
+        console.print(f"[red]Error:[/red] '{first_component}' is a reserved system name and cannot be used as a directory")
+        console.print("[dim]Tip: Windows reserves these names for system devices[/dim]")
+        raise SystemExit(1)
+
+    return spec_dir
+
+def _parse_rate_limit_headers(headers: httpx.Headers) -> dict:
+    """Extract and parse GitHub rate-limit headers."""
+    info = {}
+    
+    # Standard GitHub rate-limit headers
+    if "X-RateLimit-Limit" in headers:
+        info["limit"] = headers.get("X-RateLimit-Limit")
+    if "X-RateLimit-Remaining" in headers:
+        info["remaining"] = headers.get("X-RateLimit-Remaining")
+    if "X-RateLimit-Reset" in headers:
+        reset_epoch = int(headers.get("X-RateLimit-Reset", "0"))
+        if reset_epoch:
+            reset_time = datetime.fromtimestamp(reset_epoch, tz=timezone.utc)
+            info["reset_epoch"] = reset_epoch
+            info["reset_time"] = reset_time
+            info["reset_local"] = reset_time.astimezone()
+    
+    # Retry-After header (seconds or HTTP-date)
+    if "Retry-After" in headers:
+        retry_after = headers.get("Retry-After")
+        try:
+            info["retry_after_seconds"] = int(retry_after)
+        except ValueError:
+            # HTTP-date format - not implemented, just store as string
+            info["retry_after"] = retry_after
+    
+    return info
+
+def _format_rate_limit_error(status_code: int, headers: httpx.Headers, url: str) -> str:
+    """Format a user-friendly error message with rate-limit information."""
+    rate_info = _parse_rate_limit_headers(headers)
+    
+    lines = [f"GitHub API returned status {status_code} for {url}"]
+    lines.append("")
+    
+    if rate_info:
+        lines.append("[bold]Rate Limit Information:[/bold]")
+        if "limit" in rate_info:
+            lines.append(f"  • Rate Limit: {rate_info['limit']} requests/hour")
+        if "remaining" in rate_info:
+            lines.append(f"  • Remaining: {rate_info['remaining']}")
+        if "reset_local" in rate_info:
+            reset_str = rate_info["reset_local"].strftime("%Y-%m-%d %H:%M:%S %Z")
+            lines.append(f"  • Resets at: {reset_str}")
+        if "retry_after_seconds" in rate_info:
+            lines.append(f"  • Retry after: {rate_info['retry_after_seconds']} seconds")
+        lines.append("")
+    
+    # Add troubleshooting guidance
+    lines.append("[bold]Troubleshooting Tips:[/bold]")
+    lines.append("  • If you're on a shared CI or corporate environment, you may be rate-limited.")
+    lines.append("  • Consider using a GitHub token via --github-token or the GH_TOKEN/GITHUB_TOKEN")
+    lines.append("    environment variable to increase rate limits.")
+    lines.append("  • Authenticated requests have a limit of 5,000/hour vs 60/hour for unauthenticated.")
+    
+    return "\n".join(lines)
 
 # Agent configuration with name, folder, install URL, and CLI tool requirement
 AGENT_CONFIG = {
@@ -132,6 +310,12 @@ AGENT_CONFIG = {
         "install_url": "https://www.codebuddy.ai/cli",
         "requires_cli": True,
     },
+    "qoder": {
+        "name": "Qoder CLI",
+        "folder": ".qoder/",
+        "install_url": "https://qoder.com/cli",
+        "requires_cli": True,
+    },
     "roo": {
         "name": "Roo Code",
         "folder": ".roo/",
@@ -149,6 +333,18 @@ AGENT_CONFIG = {
         "folder": ".agents/",
         "install_url": "https://ampcode.com/manual#install",
         "requires_cli": True,
+    },
+    "shai": {
+        "name": "SHAI",
+        "folder": ".shai/",
+        "install_url": "https://github.com/ovh/shai",
+        "requires_cli": True,
+    },
+    "bob": {
+        "name": "IBM Bob",
+        "folder": ".bob/",
+        "install_url": None,  # IDE-based
+        "requires_cli": False,
     },
 }
 
@@ -577,10 +773,11 @@ def download_template_from_github(ai_assistant: str, download_dir: Path, *, scri
         )
         status = response.status_code
         if status != 200:
-            msg = f"GitHub API returned {status} for {api_url}"
+            # Format detailed error message with rate-limit info
+            error_msg = _format_rate_limit_error(status, response.headers, api_url)
             if debug:
-                msg += f"\nResponse headers: {response.headers}\nBody (truncated 500): {response.text[:500]}"
-            raise RuntimeError(msg)
+                error_msg += f"\n\n[dim]Response body (truncated 500):[/dim]\n{response.text[:500]}"
+            raise RuntimeError(error_msg)
         try:
             release_data = response.json()
         except ValueError as je:
@@ -627,8 +824,11 @@ def download_template_from_github(ai_assistant: str, download_dir: Path, *, scri
             headers=_github_auth_headers(github_token),
         ) as response:
             if response.status_code != 200:
-                body_sample = response.text[:400]
-                raise RuntimeError(f"Download failed with {response.status_code}\nHeaders: {response.headers}\nBody (truncated): {body_sample}")
+                # Handle rate-limiting on download as well
+                error_msg = _format_rate_limit_error(response.status_code, response.headers, download_url)
+                if debug:
+                    error_msg += f"\n\n[dim]Response body (truncated 400):[/dim]\n{response.text[:400]}"
+                raise RuntimeError(error_msg)
             total_size = int(response.headers.get('content-length', 0))
             with open(zip_path, 'wb') as f:
                 if total_size == 0:
@@ -668,7 +868,98 @@ def download_template_from_github(ai_assistant: str, download_dir: Path, *, scri
     }
     return zip_path, metadata
 
-def download_and_extract_template(project_path: Path, ai_assistant: str, script_type: str, is_current_dir: bool = False, *, verbose: bool = True, tracker: StepTracker | None = None, client: httpx.Client = None, debug: bool = False, github_token: str = None) -> Path:
+def update_spec_directory_references(project_path: Path, spec_dir: str, verbose: bool = True, tracker: StepTracker | None = None) -> None:
+    """Update hardcoded 'specs' references to use custom spec directory."""
+
+    # Files that commonly contain specs/ references
+    patterns_to_update = [
+        "**/*.sh",
+        "**/*.ps1",
+        "**/*.md",
+        "**/*.json",
+        "**/*.yaml",
+        "**/*.yml",
+        "**/*.toml",
+    ]
+    
+    updated_files = 0
+    total_replacements = 0
+    
+    # Check if we will rename specs/ directory (target doesn't exist)
+    specs_dir = project_path / "specs"
+    will_rename_specs = specs_dir.exists() and specs_dir.is_dir() and not (project_path / spec_dir).exists()
+    
+    for pattern in patterns_to_update:
+        for file_path in project_path.glob(pattern):
+            if file_path.is_file():
+                # Skip files inside specs/ directory if we're not renaming it
+                if not will_rename_specs and specs_dir in file_path.parents:
+                    continue
+                    
+                try:
+                    # Read file content
+                    content = file_path.read_text(encoding='utf-8')
+                    original_content = content
+                    
+                    # Replace various specs/ patterns using safer, more precise regex approach
+
+                    # Use a unique temporary placeholder that won't conflict with content
+                    temp_placeholder = f"__SPECS_TEMP_{uuid.uuid4().hex}__"
+
+                    # More precise regex patterns to avoid data corruption
+                    # Handle patterns in order of specificity to avoid conflicts
+
+                    # First handle specs- followed by various characters (specs-word, specs-[123], etc.)
+                    content = re.sub(r'(?<![a-zA-Z0-9_-])specs(?=-[a-zA-Z0-9_\-\[\]])', temp_placeholder, content)
+
+                    # Handle specs/ patterns (more permissive about what follows)
+                    content = re.sub(r'(?<![a-zA-Z0-9_-])specs/', f'{temp_placeholder}/', content)
+
+                    # Handle standalone "specs" word (not followed by / or - or other word char)
+                    content = re.sub(r'(?<![a-zA-Z0-9_-])specs(?![a-zA-Z0-9_/-])', temp_placeholder, content)
+
+                    # Then replace template placeholders with actual spec_dir
+                    content = content.replace('{SPEC_DIR}', spec_dir)
+
+                    # Finally, replace temporary placeholder with actual spec_dir
+                    content = content.replace(temp_placeholder, spec_dir)
+                    
+                    # Write back if changed
+                    if content != original_content:
+                        file_path.write_text(content, encoding='utf-8')
+                        updated_files += 1
+                        # Count actual replacements more accurately
+                        total_replacements += len(re.findall(r'(?<![a-zA-Z0-9_-])specs(?=[/ -]|$)', original_content))
+                        
+                        if verbose and not tracker:
+                            console.print(f"  Updated: {file_path.relative_to(project_path)}")
+                
+                except Exception as e:
+                    if verbose:
+                        console.print(f"[yellow]Warning:[/yellow] Could not update {file_path}: {e}")
+    
+    # Rename the actual specs directory if it exists (using the check from above)
+    if will_rename_specs:
+        new_specs_dir = project_path / spec_dir
+        try:
+            specs_dir.rename(new_specs_dir)
+            if verbose and not tracker:
+                console.print(f"  Renamed directory: specs/ -> {spec_dir}/")
+        except Exception as e:
+            if verbose:
+                console.print(f"[yellow]Warning:[/yellow] Could not rename specs/ directory: {e}")
+    elif specs_dir.exists() and verbose:
+        # Target exists, so we're not renaming
+        console.print(f"[yellow]Warning:[/yellow] Target directory '{spec_dir}/' already exists, keeping specs/")
+    
+    if tracker:
+        tracker.complete("update-spec-dir", f"updated {updated_files} files, {total_replacements} replacements")
+    elif verbose and updated_files > 0:
+        console.print(f"[green]Updated {updated_files} files with {total_replacements} spec directory references[/green]")
+        console.print(f"[dim]Tip: Set SPECIFY_SPEC_DIR environment variable to '{spec_dir}' for shell scripts to use the custom directory[/dim]")
+
+
+def download_and_extract_template(project_path: Path, ai_assistant: str, script_type: str, is_current_dir: bool = False, *, verbose: bool = True, tracker: StepTracker | None = None, client: httpx.Client = None, debug: bool = False, github_token: str = None, spec_dir: str = "specs") -> Path:
     """Download the latest release and extract it to create a new project.
     Returns project_path. Uses tracker if provided (with keys: fetch, download, extract, cleanup)
     """
@@ -815,6 +1106,19 @@ def download_and_extract_template(project_path: Path, ai_assistant: str, script_
             elif verbose:
                 console.print(f"Cleaned up: {zip_path.name}")
 
+    # Update spec directory references if custom directory specified
+    if spec_dir != "specs":
+        if tracker:
+            tracker.add("update-spec-dir", f"Update spec directory references to '{spec_dir}'")
+            tracker.start("update-spec-dir")
+        
+        update_spec_directory_references(project_path, spec_dir, verbose, tracker)
+        
+        if tracker:
+            tracker.complete("update-spec-dir")
+        elif verbose:
+            console.print(f"[cyan]Updated spec directory references to '{spec_dir}'[/cyan]")
+
     return project_path
 
 
@@ -865,7 +1169,7 @@ def ensure_executable_scripts(project_path: Path, tracker: StepTracker | None = 
 @app.command()
 def init(
     project_name: str = typer.Argument(None, help="Name for your new project directory (optional if using --here, or use '.' for current directory)"),
-    ai_assistant: str = typer.Option(None, "--ai", help="AI assistant to use: claude, gemini, copilot, cursor-agent, qwen, opencode, codex, windsurf, kilocode, auggie, codebuddy, amp, or q"),
+    ai_assistant: str = typer.Option(None, "--ai", help="AI assistant to use: claude, gemini, copilot, cursor-agent, qwen, opencode, codex, windsurf, kilocode, auggie, codebuddy, amp, shai, q, bob, or qoder "),
     script_type: str = typer.Option(None, "--script", help="Script type to use: sh or ps"),
     ignore_agent_tools: bool = typer.Option(False, "--ignore-agent-tools", help="Skip checks for AI agent tools like Claude Code"),
     no_git: bool = typer.Option(False, "--no-git", help="Skip git repository initialization"),
@@ -874,6 +1178,11 @@ def init(
     skip_tls: bool = typer.Option(False, "--skip-tls", help="Skip SSL/TLS verification (not recommended)"),
     debug: bool = typer.Option(False, "--debug", help="Show verbose diagnostic output for network and extraction failures"),
     github_token: str = typer.Option(None, "--github-token", help="GitHub token to use for API requests (or set GH_TOKEN or GITHUB_TOKEN environment variable)"),
+    spec_dir: str = typer.Option(
+      os.getenv("SPECIFY_SPEC_DIR") if os.getenv("SPECIFY_SPEC_DIR") and os.getenv("SPECIFY_SPEC_DIR").strip() else "specs",
+      "--spec-dir",
+      help="Custom directory path for specifications (default: specs, relative to project root)"
+  ),
 ):
     """
     Initialize a new Specify project from the latest template.
@@ -898,6 +1207,9 @@ def init(
         specify init --here --ai codebuddy
         specify init --here
         specify init --here --force  # Skip confirmation when current directory not empty
+        specify init my-project --spec-dir docs/specs  # Custom spec directory
+        specify init my-project --ai claude --spec-dir requirements  # Custom spec directory with AI
+        specify init --here --spec-dir documentation/feature-specs  # Custom spec directory in current dir
     """
 
     show_banner()
@@ -913,6 +1225,9 @@ def init(
     if not here and not project_name:
         console.print("[red]Error:[/red] Must specify either a project name, use '.' for current directory, or use --here flag")
         raise typer.Exit(1)
+
+    # Validate spec directory
+    validated_spec_dir = validate_spec_dir(spec_dir)
 
     if here:
         project_name = Path.cwd().name
@@ -1044,7 +1359,7 @@ def init(
             local_ssl_context = ssl_context if verify else False
             local_client = httpx.Client(verify=local_ssl_context)
 
-            download_and_extract_template(project_path, selected_ai, selected_script, here, verbose=False, tracker=tracker, client=local_client, debug=debug, github_token=github_token)
+            download_and_extract_template(project_path, selected_ai, selected_script, here, verbose=False, tracker=tracker, client=local_client, debug=debug, github_token=github_token, spec_dir=validated_spec_dir)
 
             ensure_executable_scripts(project_path, tracker=tracker)
 
@@ -1201,6 +1516,85 @@ def check():
 
     if not any(agent_results.values()):
         console.print("[dim]Tip: Install an AI assistant for the best experience[/dim]")
+
+@app.command()
+def version():
+    """Display version and system information."""
+    import platform
+    import importlib.metadata
+    
+    show_banner()
+    
+    # Get CLI version from package metadata
+    cli_version = "unknown"
+    try:
+        cli_version = importlib.metadata.version("specify-cli")
+    except Exception:
+        # Fallback: try reading from pyproject.toml if running from source
+        try:
+            import tomllib
+            pyproject_path = Path(__file__).parent.parent.parent / "pyproject.toml"
+            if pyproject_path.exists():
+                with open(pyproject_path, "rb") as f:
+                    data = tomllib.load(f)
+                    cli_version = data.get("project", {}).get("version", "unknown")
+        except Exception:
+            pass
+    
+    # Fetch latest template release version
+    repo_owner = "github"
+    repo_name = "spec-kit"
+    api_url = f"https://api.github.com/repos/{repo_owner}/{repo_name}/releases/latest"
+    
+    template_version = "unknown"
+    release_date = "unknown"
+    
+    try:
+        response = client.get(
+            api_url,
+            timeout=10,
+            follow_redirects=True,
+            headers=_github_auth_headers(),
+        )
+        if response.status_code == 200:
+            release_data = response.json()
+            template_version = release_data.get("tag_name", "unknown")
+            # Remove 'v' prefix if present
+            if template_version.startswith("v"):
+                template_version = template_version[1:]
+            release_date = release_data.get("published_at", "unknown")
+            if release_date != "unknown":
+                # Format the date nicely
+                try:
+                    dt = datetime.fromisoformat(release_date.replace('Z', '+00:00'))
+                    release_date = dt.strftime("%Y-%m-%d")
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    info_table = Table(show_header=False, box=None, padding=(0, 2))
+    info_table.add_column("Key", style="cyan", justify="right")
+    info_table.add_column("Value", style="white")
+
+    info_table.add_row("CLI Version", cli_version)
+    info_table.add_row("Template Version", template_version)
+    info_table.add_row("Released", release_date)
+    info_table.add_row("", "")
+    info_table.add_row("Python", platform.python_version())
+    info_table.add_row("Platform", platform.system())
+    info_table.add_row("Architecture", platform.machine())
+    info_table.add_row("OS Version", platform.version())
+
+    panel = Panel(
+        info_table,
+        title="[bold cyan]Specify CLI Information[/bold cyan]",
+        border_style="cyan",
+        padding=(1, 2)
+    )
+
+    console.print(panel)
+    console.print()
 
 def main():
     app()
